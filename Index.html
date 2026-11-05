@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+  <?!= include('Estilos'); ?>
+</head>
+<body>
+  <header class="topo">
+    <div class="marca">EstágioFlow<small>Programa MS Multiplica</small></div>
+    <nav class="abas" id="abas" role="tablist" aria-label="Cadastros"></nav>
+    <div class="usuario" id="usuario"></div>
+  </header>
+
+  <main class="layout">
+    <aside class="filtros" id="filtros" aria-label="Filtros"></aside>
+    <section class="conteudo">
+      <div class="barra">
+        <input type="search" id="busca" aria-label="Pesquisar" autocomplete="off">
+        <button type="button" class="primario" id="btnNovo">Cadastrar</button>
+        <button type="button" class="secundario" id="btnRecarregar">Atualizar dados</button>
+      </div>
+      <div class="resumo" id="resumo" aria-live="polite"></div>
+      <div class="tabela-wrap"><table id="tabela"></table></div>
+      <nav class="paginacao" id="paginacao" aria-label="Paginação"></nav>
+    </section>
+  </main>
+
+  <div class="fundo" id="fundo" hidden></div>
+  <aside class="painel" id="painel" role="dialog" aria-modal="true" aria-labelledby="painelTitulo" hidden>
+    <header class="painel-topo">
+      <div>
+        <h2 id="painelTitulo" tabindex="-1"></h2>
+        <p id="painelSub"></p>
+      </div>
+      <button type="button" class="icone" id="btnFechar" aria-label="Fechar">×</button>
+    </header>
+    <nav class="secoes" id="secoes" aria-label="Seções do registro"></nav>
+    <form class="painel-corpo" id="form" novalidate></form>
+    <footer class="painel-rodape" id="rodape"></footer>
+  </aside>
+
+  <div class="aviso" id="aviso" role="status" aria-live="assertive"></div>
+  <div class="carregando" id="carregando">
+    <div class="spinner" id="spinner"></div>
+    <p id="carregandoMsg">Carregando...</p>
+    <button type="button" class="primario" id="btnTentar" hidden>Tentar novamente</button>
+  </div>
+
+  <?!= include('App'); ?>
+</body>
+</html>

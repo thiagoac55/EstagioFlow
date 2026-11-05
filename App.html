@@ -1,0 +1,498 @@
+<script>
+  window.addEventListener('error', e => falhaCarga('Erro na página: ' + (e.message || 'desconhecido')));
+  window.addEventListener('unhandledrejection', e => falhaCarga((e.reason && e.reason.message) || String(e.reason)));
+
+  const LIMITE_RESPOSTA = 45000;
+  const E = {
+    dados: null, ent: 'estagiarios', buscas: {}, filtros: {}, ordem: {}, pagina: 1, porPagina: 25,
+    expandidos: new Set(), atual: null, editando: false, sujo: false, retorno: null
+  };
+  const VAZIO = '(em branco)';
+  const LIMITE_FACETA = 6;
+
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const norm = s => String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  const comparar = (a, b) => a.localeCompare(b, 'pt-BR', { numeric: true, sensitivity: 'base' });
+  const ent = (k = E.ent) => E.dados.entidades[k];
+  const nomeDe = (en, r) => r.v[en.tabela[0]] || 'Sem nome';
+  const fmtData = s => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s); return m ? `${m[3]}/${m[2]}/${m[1]}` : s; };
+
+  function chamar(fn, ...args) {
+    return new Promise((ok, falha) => {
+      const limite = setTimeout(() => falha(new Error('O servidor não respondeu. Se você estiver conectado em mais de uma conta Google neste navegador, saia das outras contas ou abra o EstágioFlow em uma janela anônima.')), LIMITE_RESPOSTA);
+      google.script.run
+        .withSuccessHandler(r => { clearTimeout(limite); ok(r); })
+        .withFailureHandler(e => {
+          clearTimeout(limite);
+          falha(new Error(String((e && e.message) || e).replace(/^(Exception|Error):\s*/, '')));
+        })[fn](...args);
+    });
+  }
+
+  function falhaCarga(msg) {
+    console.error('EstágioFlow:', msg);
+    if ($('carregando').hidden) return aviso(msg, 'erro');
+    $('spinner').hidden = true;
+    $('carregandoMsg').textContent = 'Não foi possível carregar os dados. ' + msg;
+    $('btnTentar').hidden = false;
+  }
+
+  function aviso(msg, tipo) {
+    const el = $('aviso');
+    el.textContent = msg;
+    el.className = 'aviso visivel ' + (tipo || '');
+    clearTimeout(aviso.t);
+    aviso.t = setTimeout(() => { el.className = 'aviso'; }, tipo === 'erro' ? 9000 : 4000);
+  }
+
+  function tom(v) {
+    const s = norm(v);
+    if (!s) return '';
+    if (/^(aprovado|deferido|assinado$|correto|sim$)/.test(s)) return 'ok';
+    if (/^(reprovado|indeferido|desligado|nao$|sem assinatura)/.test(s)) return 'ruim';
+    if (/(analise|pendente|incompleta|suspenso|falta|parcial|recurso|sub judice|final de lista)/.test(s)) return 'pendente';
+    return 'neutro';
+  }
+  const pill = v => `<span class="pill ${tom(v)}">${esc(v)}</span>`;
+  // O processador do Apps Script corta linhas com barras duplas; por isso a regex usa \/{2}.
+  const PADRAO_URL = new RegExp('^https?:\\/{2}\\S', 'i');
+  const urlSegura = u => PADRAO_URL.test(u || '');
+  const ICONE_PASTA = '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z"/></svg>';
+  const iconePasta = (url, nome) => `<a class="pasta" href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="Abrir pasta" aria-label="Abrir pasta de ${esc(nome)}">${ICONE_PASTA}</a>`;
+
+  async function carregar() {
+    $('carregando').hidden = false;
+    $('spinner').hidden = false;
+    $('carregandoMsg').textContent = 'Carregando...';
+    $('btnTentar').hidden = true;
+    try {
+      const dados = await chamar('carregarDados');
+      if (!dados || !dados.entidades) throw new Error('O servidor devolveu uma resposta vazia.');
+      E.dados = dados;
+      $('usuario').textContent = E.dados.usuario || '';
+      prepararBusca();
+      render();
+      $('carregando').hidden = true;
+    } catch (e) {
+      if (E.dados) {
+        $('carregando').hidden = true;
+        aviso('Não foi possível atualizar os dados: ' + e.message, 'erro');
+      } else {
+        falhaCarga(e.message);
+      }
+    }
+  }
+
+  function prepararBusca() {
+    $('busca').value = E.buscas[E.ent] || '';
+    $('busca').placeholder = ent().dicaBusca || 'Pesquisar';
+  }
+
+  function trocar(k) {
+    if (k === E.ent) return;
+    E.ent = k;
+    E.pagina = 1;
+    prepararBusca();
+    render();
+  }
+
+  function textoBusca(r) {
+    if (!r._txt) {
+      const v = r.v.filter((x, i) => ent().campos[i].tipo !== 'link');
+      r._txt = norm(v.join(' ')) + ' ' + v.map(x => x.replace(/\D/g, '')).filter(Boolean).join(' ');
+    }
+    return r._txt;
+  }
+
+  function filtrar(exceto) {
+    const f = E.filtros[E.ent] || {};
+    const termos = norm(E.buscas[E.ent]).split(/\s+/).filter(Boolean);
+    return ent().registros.filter(r => {
+      for (const k in f) {
+        if (Number(k) === exceto || !f[k].size) continue;
+        if (!f[k].has(r.v[k] || VAZIO)) return false;
+      }
+      return !termos.length || termos.every(t => textoBusca(r).includes(t));
+    });
+  }
+
+  function ordenar(lista) {
+    const o = E.ordem[E.ent];
+    if (!o) return lista;
+    return lista.slice().sort((a, b) => {
+      const x = a.v[o.i] || '', y = b.v[o.i] || '';
+      if (!x || !y) return (!x) - (!y);
+      return comparar(x, y) * (o.asc ? 1 : -1);
+    });
+  }
+
+  function temFiltro() {
+    const f = E.filtros[E.ent] || {};
+    return !!norm(E.buscas[E.ent]) || Object.values(f).some(s => s.size);
+  }
+
+  function render() {
+    const abas = Object.keys(E.dados.entidades);
+    $('abas').innerHTML = abas.map(k => `<button type="button" role="tab" data-ent="${k}" aria-selected="${k === E.ent}">${esc(ent(k).titulo)}<span>${ent(k).registros.length}</span></button>`).join('');
+    $('btnNovo').textContent = 'Cadastrar ' + ent().singular;
+    renderFiltros();
+    const lista = ordenar(filtrar());
+    const paginas = Math.max(1, Math.ceil(lista.length / E.porPagina));
+    E.pagina = Math.min(Math.max(1, E.pagina), paginas);
+    const ini = (E.pagina - 1) * E.porPagina;
+    renderResumo(lista.length, ini);
+    renderTabela(lista.slice(ini, ini + E.porPagina));
+    $('paginacao').innerHTML = paginas < 2 ? '' :
+      `<button type="button" class="secundario" data-pag="${E.pagina - 1}"${E.pagina === 1 ? ' disabled' : ''}>Anterior</button>
+       <span>Página ${E.pagina} de ${paginas}</span>
+       <button type="button" class="secundario" data-pag="${E.pagina + 1}"${E.pagina === paginas ? ' disabled' : ''}>Próxima</button>`;
+  }
+
+  function renderFiltros() {
+    const en = ent(), f = (E.filtros[E.ent] = E.filtros[E.ent] || {});
+    const html = en.filtros.map(i => {
+      const sel = f[i] || new Set(), cont = {};
+      filtrar(i).forEach(r => { const v = r.v[i] || VAZIO; cont[v] = (cont[v] || 0) + 1; });
+      const vals = [...new Set([...Object.keys(cont), ...sel])].sort((a, b) => (a === VAZIO) - (b === VAZIO) || comparar(a, b));
+      if (!vals.length) return '';
+      const chave = E.ent + ':' + i, aberto = E.expandidos.has(chave);
+      const vis = vals.filter((v, k) => aberto || k < LIMITE_FACETA || sel.has(v));
+      return `<fieldset class="faceta"><legend>${esc(en.campos[i].rotulo)}</legend>
+        ${vis.map(v => `<label class="opcao"><input type="checkbox" data-f="${i}" value="${esc(v)}"${sel.has(v) ? ' checked' : ''}><span>${esc(v)}</span><b>${cont[v] || 0}</b></label>`).join('')}
+        ${vals.length > LIMITE_FACETA ? `<button type="button" class="link" data-expandir="${chave}">${aberto ? 'Mostrar menos' : `Mostrar todos (${vals.length})`}</button>` : ''}
+      </fieldset>`;
+    }).join('');
+    $('filtros').innerHTML = '<h2>Filtrar por</h2>' + (html || '<p class="nada">Sem dados para filtrar.</p>');
+  }
+
+  function renderResumo(total, ini) {
+    const en = ent();
+    let txt;
+    if (!total) txt = `Nenhum ${en.singular} encontrado`;
+    else if (total === 1) txt = `1 ${en.singular}`;
+    else txt = `Mostrando ${ini + 1}–${Math.min(ini + E.porPagina, total)} de ${total} ${en.titulo.toLowerCase()}`;
+    $('resumo').innerHTML = `<span>${txt}</span>` + (temFiltro() ? '<button type="button" class="link" id="btnLimpar">Limpar pesquisa e filtros</button>' : '');
+  }
+
+  function renderTabela(pagina) {
+    const en = ent(), o = E.ordem[E.ent];
+    const cab = en.tabela.map(i => {
+      const ativa = o && o.i === i;
+      const sort = ativa ? (o.asc ? 'ascending' : 'descending') : 'none';
+      return `<th aria-sort="${sort}"><button type="button" data-ordem="${i}">${esc(en.campos[i].rotulo)}${ativa ? (o.asc ? ' ▲' : ' ▼') : ''}</button></th>`;
+    }).join('');
+    let corpo;
+    if (!pagina.length) {
+      const msg = en.registros.length
+        ? 'Nenhum resultado para esta pesquisa. Ajuste os termos ou limpe os filtros.'
+        : `Nenhum ${en.singular} cadastrado. Use “Cadastrar ${en.singular}” para incluir o primeiro.`;
+      corpo = `<tr><td class="vazio" colspan="${en.tabela.length}">${msg}</td></tr>`;
+    } else {
+      corpo = pagina.map(r => `<tr data-linha="${r.linha}" tabindex="0">${en.tabela.map(i => {
+        const c = en.campos[i], v = r.v[i], url = c.link !== undefined ? r.v[c.link] : '';
+        return `<td>${urlSegura(url) ? iconePasta(url, v) : ''}${!v ? '' : c.opcoes ? pill(v) : esc(c.tipo === 'data' ? fmtData(v) : v)}</td>`;
+      }).join('')}</tr>`).join('');
+    }
+    $('tabela').innerHTML = `<thead><tr>${cab}</tr></thead><tbody>${corpo}</tbody>`;
+  }
+
+  function abrir(r, editar) {
+    if (!$('painel').hidden && !podeSair()) return;
+    if ($('painel').hidden) E.retorno = document.activeElement;
+    E.atual = r;
+    E.editando = !!editar || !r;
+    E.sujo = false;
+    renderPainel();
+    $('painel').hidden = false;
+    $('fundo').hidden = false;
+    requestAnimationFrame(() => $('painel').classList.add('aberto'));
+    $('form').scrollTop = 0;
+    if (E.editando) focarPrimeiro(); else $('painelTitulo').focus();
+  }
+
+  function fechar(forcar) {
+    if (!forcar && !podeSair()) return;
+    $('painel').classList.remove('aberto');
+    $('painel').hidden = true;
+    $('fundo').hidden = true;
+    E.atual = null;
+    E.editando = false;
+    E.sujo = false;
+    if (E.retorno && document.contains(E.retorno)) E.retorno.focus();
+    E.retorno = null;
+  }
+
+  function podeSair() {
+    return !(E.editando && E.sujo) || confirm('Existem alterações não salvas. Deseja descartá-las?');
+  }
+
+  function focarPrimeiro() {
+    const el = $('form').querySelector('input, select, textarea');
+    if (el) el.focus();
+  }
+
+  function sugestoes(en) {
+    const out = {};
+    const add = (i, vals) => { out[i] = [...new Set([...(out[i] || []), ...vals.filter(Boolean)])].sort(comparar); };
+    en.sugestoes.forEach(i => add(i, en.registros.map(r => r.v[i])));
+    Object.keys(E.dados.entidades).forEach(k => {
+      const o = ent(k);
+      if (!o.vinculo || o.vinculo.entidade !== E.ent) return;
+      const i = en.campos.findIndex(c => c.rotulo === o.vinculo.rotulo);
+      if (i >= 0) add(i, o.registros.map(r => r.v[o.tabela[0]]));
+    });
+    return out;
+  }
+
+  function renderPainel() {
+    const en = ent(), r = E.atual, v = r ? r.v : en.campos.map(() => '');
+    $('painelTitulo').textContent = r ? nomeDe(en, r) : 'Cadastrar ' + en.singular;
+    $('painelSub').textContent = r ? '' : 'Preencha os dados e clique em Cadastrar. Campos com * são obrigatórios.';
+    $('painelSub').hidden = !!r;
+
+    const grupos = [...new Set(en.campos.map(c => c.grupo))];
+    const sug = E.editando ? sugestoes(en) : {};
+    let html = '';
+    grupos.forEach((g, k) => {
+      const cs = en.campos.filter(c => c.grupo === g).sort((a, b) => a.pos - b.pos);
+      const compacto = cs.length >= 8 && cs.every(c => c.opcoes);
+      let sub = '';
+      html += `<section class="grupo${compacto ? ' compacto' : ''}" id="sec-${k}"><h3>${esc(g)}</h3><div class="grade">`;
+      cs.forEach(c => {
+        if (c.sub && c.sub !== sub) html += `<h4 class="sub">${esc(c.sub)}</h4>`;
+        sub = c.sub;
+        html += campoHtml(en, c, v[c.i] || '', sug, compacto);
+      });
+      html += '</div></section>';
+    });
+    if (r && en.vinculo && !E.editando) html += vinculadosHtml(en, r);
+    html += Object.keys(sug).map(i => `<datalist id="dl-${i}">${sug[i].map(x => `<option value="${esc(x)}">`).join('')}</datalist>`).join('');
+    $('form').innerHTML = html;
+
+    $('secoes').hidden = grupos.length < 2;
+    $('secoes').innerHTML = grupos.map((g, k) => `<button type="button" data-sec="sec-${k}">${esc(g)}</button>`).join('');
+    $('rodape').innerHTML = E.editando
+      ? `<button type="button" class="primario" id="btnSalvar">${r ? 'Salvar alterações' : 'Cadastrar'}</button><button type="button" class="secundario" id="btnCancelar">Cancelar</button>`
+      : `<button type="button" class="primario" id="btnEditar">Editar</button><button type="button" class="secundario" id="btnFecharRodape">Fechar</button>`;
+  }
+
+  function campoHtml(en, c, val, sug, compacto) {
+    const obrig = en.obrigatorios.includes(c.i);
+    const rot = esc(c.rotulo) + (obrig ? ' <abbr title="obrigatório">*</abbr>' : '');
+    const classe = 'campo' + (c.tipo === 'textoLongo' ? ' largo' : '');
+    if (!E.editando) {
+      let conteudo;
+      if (!val) conteudo = `<span class="nada">${compacto ? '—' : 'Não informado'}</span>`;
+      else if (c.opcoes) conteudo = pill(val);
+      else if (c.tipo === 'data') conteudo = esc(fmtData(val));
+      else if (c.tipo === 'link') conteudo = urlSegura(val) ? `<a class="abrir-link" href="${esc(val)}" target="_blank" rel="noopener noreferrer">${ICONE_PASTA}Abrir pasta</a>` : esc(val);
+      else if (c.tipo === 'email') conteudo = `<a href="mailto:${esc(val)}">${esc(val)}</a>`;
+      else conteudo = esc(val);
+      return `<div class="${classe}"><span class="rotulo">${rot}</span><div class="valor">${conteudo}</div></div>`;
+    }
+    const id = 'c' + c.i, base = `id="${id}" name="${id}"${obrig ? ' required' : ''}`;
+    let ctrl;
+    if (c.opcoes) {
+      const ops = !val || c.opcoes.includes(val) ? c.opcoes : [val, ...c.opcoes];
+      ctrl = `<select ${base}><option value=""></option>${ops.map(o => `<option value="${esc(o)}"${o === val ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
+    } else if (c.tipo === 'textoLongo') {
+      ctrl = `<textarea ${base} rows="4">${esc(val)}</textarea>`;
+    } else {
+      const tipo = c.tipo === 'data' && (!val || /^\d{4}-\d{2}-\d{2}$/.test(val)) ? 'date' : c.tipo === 'email' ? 'email' : c.tipo === 'link' ? 'url' : 'text';
+      const dica = c.tipo === 'link' ? ' placeholder="Cole aqui o link da pasta no Google Drive"' : '';
+      ctrl = `<input type="${tipo}" ${base} value="${esc(val)}"${dica}${sug[c.i] ? ` list="dl-${c.i}"` : ''} autocomplete="off">`;
+    }
+    return `<div class="${classe}"><label for="${id}">${rot}</label>${ctrl}</div>`;
+  }
+
+  function vinculadosHtml(en, r) {
+    const alvo = ent(en.vinculo.entidade);
+    const i = alvo.campos.findIndex(c => c.rotulo === en.vinculo.rotulo);
+    const nome = norm(r.v[en.tabela[0]]);
+    const lista = i < 0 || !nome ? [] : alvo.registros.filter(x => norm(x.v[i]) === nome);
+    const st = alvo.filtros[0];
+    const itens = lista.map(x => `<li><button type="button" class="link" data-abrir="${en.vinculo.entidade}:${x.linha}">${esc(nomeDe(alvo, x))}</button>${st !== undefined && x.v[st] ? pill(x.v[st]) : ''}</li>`).join('');
+    return `<section class="grupo"><h3>${esc(alvo.titulo)} vinculados</h3>${itens ? `<ul class="vinculados">${itens}</ul>` : `<p class="nada">Nenhum ${alvo.singular} tem este nome no campo “${esc(en.vinculo.rotulo)}”.</p>`}</section>`;
+  }
+
+  async function salvar() {
+    const en = ent(), form = $('form'), novos = {}, faltando = [];
+    form.querySelectorAll('.invalido').forEach(el => el.classList.remove('invalido'));
+    en.campos.forEach(c => {
+      const el = form.elements['c' + c.i];
+      if (!el) return;
+      novos[c.i] = el.value.trim();
+      if ((el.required && !novos[c.i]) || !el.checkValidity()) {
+        el.classList.add('invalido');
+        el.setAttribute('aria-invalid', 'true');
+        faltando.push(c.rotulo);
+      }
+    });
+    if (faltando.length) {
+      aviso('Verifique os campos: ' + faltando.join(', ') + '.', 'erro');
+      form.querySelector('.invalido').focus();
+      return;
+    }
+
+    const btn = $('btnSalvar');
+    btn.disabled = true;
+    btn.textContent = E.atual ? 'Salvando…' : 'Cadastrando…';
+    try {
+      let r;
+      if (E.atual) {
+        const alt = {};
+        Object.keys(novos).forEach(i => { if (novos[i] !== (E.atual.v[i] || '')) alt[i] = novos[i]; });
+        if (!Object.keys(alt).length) {
+          E.editando = false;
+          renderPainel();
+          aviso('Nenhuma alteração para salvar.');
+          return;
+        }
+        r = await chamar('salvarRegistro', E.ent, E.atual.linha, E.atual.versao, alt);
+        const pos = en.registros.findIndex(x => x.linha === r.linha);
+        if (pos >= 0) en.registros[pos] = r;
+        aviso('Alterações salvas na planilha.', 'ok');
+      } else {
+        r = await chamar('criarRegistro', E.ent, novos);
+        en.registros.push(r);
+        aviso(en.singular.charAt(0).toUpperCase() + en.singular.slice(1) + ' cadastrado na planilha.', 'ok');
+      }
+      E.atual = r;
+      E.editando = false;
+      E.sujo = false;
+      renderPainel();
+      render();
+      $('painelTitulo').focus();
+    } catch (e) {
+      aviso(e.message.replace(/^CONFLITO:\s*/, ''), 'erro');
+      btn.disabled = false;
+      btn.textContent = E.atual ? 'Salvar alterações' : 'Cadastrar';
+    }
+  }
+
+  let atraso;
+  $('busca').addEventListener('input', e => {
+    clearTimeout(atraso);
+    atraso = setTimeout(() => { E.buscas[E.ent] = e.target.value; E.pagina = 1; render(); }, 150);
+  });
+
+  $('abas').addEventListener('click', e => {
+    const b = e.target.closest('[data-ent]');
+    if (b) trocar(b.dataset.ent);
+  });
+
+  $('filtros').addEventListener('change', e => {
+    const cb = e.target.closest('[data-f]');
+    if (!cb) return;
+    const f = E.filtros[E.ent], i = cb.dataset.f;
+    f[i] = f[i] || new Set();
+    cb.checked ? f[i].add(cb.value) : f[i].delete(cb.value);
+    E.pagina = 1;
+    render();
+    const alvo = [...$('filtros').querySelectorAll(`[data-f="${i}"]`)].find(x => x.value === cb.value);
+    if (alvo) alvo.focus();
+  });
+
+  $('filtros').addEventListener('click', e => {
+    const b = e.target.closest('[data-expandir]');
+    if (!b) return;
+    const k = b.dataset.expandir;
+    E.expandidos.has(k) ? E.expandidos.delete(k) : E.expandidos.add(k);
+    renderFiltros();
+    const novo = $('filtros').querySelector(`[data-expandir="${k}"]`);
+    if (novo) novo.focus();
+  });
+
+  $('resumo').addEventListener('click', e => {
+    if (e.target.id !== 'btnLimpar') return;
+    E.buscas[E.ent] = '';
+    E.filtros[E.ent] = {};
+    E.pagina = 1;
+    $('busca').value = '';
+    render();
+    $('busca').focus();
+  });
+
+  $('tabela').addEventListener('click', e => {
+    if (e.target.closest('a')) return;
+    const o = e.target.closest('[data-ordem]');
+    if (o) {
+      const i = Number(o.dataset.ordem), atual = E.ordem[E.ent];
+      E.ordem[E.ent] = atual && atual.i === i ? (atual.asc ? { i, asc: false } : null) : { i, asc: true };
+      render();
+      const b = $('tabela').querySelector(`[data-ordem="${i}"]`);
+      if (b) b.focus();
+      return;
+    }
+    const tr = e.target.closest('tr[data-linha]');
+    if (tr) abrir(ent().registros.find(r => r.linha === Number(tr.dataset.linha)));
+  });
+
+  $('tabela').addEventListener('keydown', e => {
+    const tr = e.target.closest('tr[data-linha]');
+    if (e.target.closest('a')) return;
+    if (tr && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      abrir(ent().registros.find(r => r.linha === Number(tr.dataset.linha)));
+    }
+  });
+
+  $('paginacao').addEventListener('click', e => {
+    const b = e.target.closest('[data-pag]');
+    if (!b || b.disabled) return;
+    E.pagina = Number(b.dataset.pag);
+    render();
+    $('tabela').scrollIntoView({ block: 'start' });
+  });
+
+  $('btnTentar').addEventListener('click', carregar);
+  $('btnNovo').addEventListener('click', () => abrir(null, true));
+  $('btnRecarregar').addEventListener('click', () => { if ($('painel').hidden || podeSair()) { fechar(true); carregar(); } });
+  $('btnFechar').addEventListener('click', () => fechar());
+  $('fundo').addEventListener('click', () => fechar());
+
+  $('secoes').addEventListener('click', e => {
+    const b = e.target.closest('[data-sec]');
+    if (b) document.getElementById(b.dataset.sec).scrollIntoView({ block: 'start' });
+  });
+
+  $('form').addEventListener('input', e => {
+    E.sujo = true;
+    if (e.target.classList.contains('invalido')) {
+      e.target.classList.remove('invalido');
+      e.target.removeAttribute('aria-invalid');
+    }
+  });
+  $('form').addEventListener('submit', e => { e.preventDefault(); if (E.editando) salvar(); });
+  $('form').addEventListener('click', e => {
+    const b = e.target.closest('[data-abrir]');
+    if (!b) return;
+    const [k, linha] = b.dataset.abrir.split(':');
+    const r = ent(k).registros.find(x => x.linha === Number(linha));
+    if (!r) return;
+    trocar(k);
+    abrir(r);
+  });
+
+  $('rodape').addEventListener('click', e => {
+    const id = e.target.id;
+    if (id === 'btnSalvar') salvar();
+    else if (id === 'btnFecharRodape') fechar();
+    else if (id === 'btnEditar') { E.editando = true; E.sujo = false; renderPainel(); focarPrimeiro(); }
+    else if (id === 'btnCancelar') {
+      if (!podeSair()) return;
+      if (!E.atual) return fechar(true);
+      E.editando = false;
+      E.sujo = false;
+      renderPainel();
+      $('painelTitulo').focus();
+    }
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !$('painel').hidden) fechar();
+  });
+
+  carregar();
+</script>
